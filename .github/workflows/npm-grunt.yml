@@ -1,4 +1,4 @@
-name: NodeJS with Grunt
+name: Build and Deploy to Pages
 
 on:
   push:
@@ -6,25 +6,101 @@ on:
   pull_request:
     branches: [ "pages" ]
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+env:
+  NODE_VERSION: '20.x'
+  PNPM_VERSION: '8.15.6'
 
-    strategy:
-      matrix:
-        node-version: [18.x, 20.x, 22.x]
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    name: Build and Deploy Frontend
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    defaults:
+      run:
+        working-directory: ./app-registerUI
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
-    - name: Build
-      run: |
-        pnpm install
-        grunt
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
 
-      working-directory: app-registerUI
+      - name: Detect and install dependencies
+        shell: bash
+        run: |
+          # Detect preferred package manager
+          if [ -f ".package-manager" ]; then
+            PM=$(cat .package-manager)
+            echo "Using preferred package manager: $PM"
+          elif [ -f "pnpm-lock.yaml" ]; then
+            PM="pnpm"
+            echo "Found pnpm-lock.yaml, using pnpm"
+          elif [ -f "package-lock.json" ]; then
+            PM="npm"
+            echo "Found package-lock.json, using npm"
+          else
+            PM="pnpm"
+            echo "No lockfile found, defaulting to pnpm"
+          fi
+          
+          # Install dependencies
+          case $PM in
+            "pnpm")
+              echo "Installing with pnpm..."
+              if [ -f "pnpm-lock.yaml" ]; then
+                pnpm install --frozen-lockfile || pnpm install
+              else
+                pnpm install
+              fi
+              ;;
+            "npm")
+              echo "Installing with npm..."
+              if [ -f "package-lock.json" ]; then
+                npm ci || npm install
+              else
+                npm install
+              fi
+              ;;
+            *)
+              echo "Unknown package manager: $PM, falling back to npm"
+              npm install
+              ;;
+          esac
+
+      - name: Build application
+        shell: bash
+        run: |
+          PM=$([ -f ".package-manager" ] && cat .package-manager || echo "pnpm")
+          $PM build
+        env:
+          VITE_CHAIN_ID: 43113
+          VITE_RPC_URL: https://api.avax-test.network/ext/bc/C/rpc
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./app-registerUI/dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

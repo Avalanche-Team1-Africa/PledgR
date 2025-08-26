@@ -8,9 +8,17 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+
+# Vite build outputs
 dist
 dist-ssr
 *.local
+
+# Environment files
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
 # Editor directories and files
 .vscode/*
@@ -22,3 +30,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Package manager locks (keep only one)
+# If you prefer pnpm, remove package-lock.json
+# If you prefer npm, remove pnpm-lock.yaml
+# package-lock.json
+# pnpm-lock.yaml
+# yarn.lock
+bun.lockb

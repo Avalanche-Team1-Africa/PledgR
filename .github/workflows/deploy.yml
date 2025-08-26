@@ -1,0 +1,397 @@
+name: Deploy Pledgr
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+
+env:
+  NODE_VERSION: '20.x'
+  PNPM_VERSION: '8.15.6'
+
+jobs:
+  # Smart Contract Testing and Compilation
+  contracts:
+    runs-on: ubuntu-latest
+    name: Test & Build Smart Contracts
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+
+      - name: Cache Foundry dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.foundry
+            cache
+            out
+          key: foundry-${{ runner.os }}-${{ hashFiles('foundry.toml', 'lib/**') }}
+          restore-keys: |
+            foundry-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: forge install
+
+      - name: Run Forge build
+        run: |
+          forge --version
+          forge build --sizes
+        id: build
+
+      - name: Run Forge tests
+        run: |
+          forge test -vvv
+        id: test
+
+      - name: Generate gas report
+        run: forge test --gas-report > gas-report.txt
+
+      - name: Upload gas report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gas-report
+          path: gas-report.txt
+
+      - name: Upload contract artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-artifacts
+          path: |
+            out/
+            contracts/
+
+  # Frontend Build and Test
+  frontend:
+    runs-on: ubuntu-latest
+    name: Build & Test Frontend
+    
+    defaults:
+      run:
+        working-directory: ./app-registerUI
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            ~/.npm
+            node_modules
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/pnpm-lock.yaml', '**/package-lock.json', '**/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      - name: Detect and install dependencies
+        shell: bash
+        run: |
+          # Detect preferred package manager
+          if [ -f ".package-manager" ]; then
+            PM=$(cat .package-manager)
+            echo "Using preferred package manager: $PM"
+          elif [ -f "pnpm-lock.yaml" ]; then
+            PM="pnpm"
+            echo "Found pnpm-lock.yaml, using pnpm"
+          elif [ -f "package-lock.json" ]; then
+            PM="npm"
+            echo "Found package-lock.json, using npm"
+          else
+            PM="pnpm"
+            echo "No lockfile found, defaulting to pnpm"
+          fi
+          
+          # Install dependencies
+          case $PM in
+            "pnpm")
+              echo "Installing with pnpm..."
+              if [ -f "pnpm-lock.yaml" ]; then
+                pnpm install --frozen-lockfile || pnpm install
+              else
+                pnpm install
+              fi
+              ;;
+            "npm")
+              echo "Installing with npm..."
+              if [ -f "package-lock.json" ]; then
+                npm ci || npm install
+              else
+                npm install
+              fi
+              ;;
+            *)
+              echo "Unknown package manager: $PM, falling back to npm"
+              npm install
+              ;;
+          esac
+
+      - name: Lint code
+        shell: bash
+        run: |
+          PM=$([ -f ".package-manager" ] && cat .package-manager || echo "pnpm")
+          $PM lint
+
+      - name: Type check
+        shell: bash
+        run: |
+          PM=$([ -f ".package-manager" ] && cat .package-manager || echo "pnpm")
+          $PM build:dev
+
+      - name: Build for production
+        shell: bash
+        run: |
+          PM=$([ -f ".package-manager" ] && cat .package-manager || echo "pnpm")
+          $PM build
+        env:
+          VITE_CHAIN_ID: 43113
+          VITE_RPC_URL: https://api.avax-test.network/ext/bc/C/rpc
+          VITE_GRAPHQL_ENDPOINT: ${{ secrets.VITE_GRAPHQL_ENDPOINT }}
+          VITE_INFURA_RPC: ${{ secrets.VITE_INFURA_RPC }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: app-registerUI/dist/
+
+  # Deploy Smart Contracts (Fuji Testnet)
+  deploy-contracts:
+    needs: [contracts]
+    runs-on: ubuntu-latest
+    name: Deploy Smart Contracts
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+
+      - name: Download contract artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-artifacts
+
+      - name: Deploy to Avalanche Fuji
+        run: |
+          forge script script/DeployCreatorRegistry.s.sol:DeployCreatorRegistry \
+            --rpc-url ${{ secrets.AVALANCHE_FUJI_RPC_URL }} \
+            --private-key ${{ secrets.DEPLOYER_PRIVATE_KEY }} \
+            --broadcast \
+            --verify \
+            --etherscan-api-key ${{ secrets.SNOWTRACE_API_KEY }} \
+            -vvvv
+        env:
+          ETHERSCAN_API_KEY: ${{ secrets.SNOWTRACE_API_KEY }}
+
+      - name: Save deployment addresses
+        run: |
+          echo "Contract deployment completed"
+          # Extract contract addresses from broadcast logs
+          if [ -f broadcast/DeployCreatorRegistry.s.sol/43113/run-latest.json ]; then
+            cat broadcast/DeployCreatorRegistry.s.sol/43113/run-latest.json | jq '.transactions[0].contractAddress' > contract-address.txt
+            echo "CREATOR_REGISTRY_ADDRESS=$(cat contract-address.txt)" >> $GITHUB_ENV
+          fi
+
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-artifacts
+          path: |
+            broadcast/
+            contract-address.txt
+
+  # Deploy Frontend to GitHub Pages
+  deploy-frontend:
+    needs: [frontend, deploy-contracts]
+    runs-on: ubuntu-latest
+    name: Deploy Frontend
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+      
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download frontend artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ./dist
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+ 
+  # Update The Graph Subgraph
+  deploy-subgraph:
+    needs: [deploy-contracts]
+    runs-on: ubuntu-latest
+    name: Deploy Subgraph
+    if: github.ref == 'refs/heads/main'
+    
+    defaults:
+      run:
+        working-directory: ./app-registerUI/pledg-r
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Graph CLI
+        run: npm install -g @graphprotocol/graph-cli
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Download deployment artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-artifacts
+
+      - name: Update subgraph config
+        run: |
+          # Update contract address in subgraph.yaml if deployment artifacts are available
+          if [ -f ../../contract-address.txt ]; then
+            CONTRACT_ADDRESS=$(cat ../../contract-address.txt | tr -d '"')
+            echo "Updating contract address to: $CONTRACT_ADDRESS"
+            # Replace address in subgraph.yaml
+            sed -i "s/address: \".*\"/address: \"$CONTRACT_ADDRESS\"/" subgraph.yaml
+          fi
+
+      - name: Generate types
+        run: graph codegen
+
+      - name: Build subgraph
+        run: graph build
+
+      - name: Deploy subgraph
+        run: |
+          graph auth --studio ${{ secrets.GRAPH_DEPLOY_KEY }}
+          graph deploy --studio pledgr
+        env:
+          GRAPH_DEPLOY_KEY: ${{ secrets.GRAPH_DEPLOY_KEY }}
+
+  # Security and Quality Checks
+  security:
+    runs-on: ubuntu-latest
+    name: Security & Quality Checks
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Setup Node.js for security audit
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Security audit
+        run: |
+          cd app-registerUI
+          npm audit --audit-level moderate
+
+  # Notification
+  notify:
+    needs: [deploy-frontend, deploy-contracts, deploy-subgraph]
+    runs-on: ubuntu-latest
+    name: Deployment Notification
+    if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    
+    steps:
+      - name: Notify deployment status
+        uses: 8398a7/action-slack@v3
+        if: env.SLACK_WEBHOOK_URL != ''
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          text: |
+            Pledgr deployment ${{ job.status }}!
+            
+            • Frontend: ${{ needs.deploy-frontend.result }}
+            • Smart Contracts: ${{ needs.deploy-contracts.result }}
+            • Subgraph: ${{ needs.deploy-subgraph.result }}
+            
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

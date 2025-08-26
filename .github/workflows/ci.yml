@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [develop]
+
+env:
+  NODE_VERSION: '20.x'
+  PNPM_VERSION: '8.15.6'
+
+jobs:
+  # Smart Contract CI
+  contracts-ci:
+    runs-on: ubuntu-latest
+    name: Smart Contract CI
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+
+      - name: Cache Foundry dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.foundry
+            cache
+            out
+          key: foundry-${{ runner.os }}-${{ hashFiles('foundry.toml', 'lib/**') }}
+
+      - name: Install dependencies
+        run: forge install
+
+      - name: Check formatting
+        run: forge fmt --check
+
+      - name: Run tests
+        run: forge test -vvv
+
+      - name: Build contracts
+        run: forge build --sizes
+
+  # Frontend CI
+  frontend-ci:
+    runs-on: ubuntu-latest
+    name: Frontend CI
+    
+    defaults:
+      run:
+        working-directory: ./app-registerUI
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            ~/.npm
+            node_modules
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/pnpm-lock.yaml', '**/package-lock.json', '**/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      - name: Detect and install dependencies
+        shell: bash
+        run: |
+          # Detect preferred package manager
+          if [ -f ".package-manager" ]; then
+            PM=$(cat .package-manager)
+            echo "Using preferred package manager: $PM"
+          elif [ -f "pnpm-lock.yaml" ]; then
+            PM="pnpm"
+            echo "Found pnpm-lock.yaml, using pnpm"
+          elif [ -f "package-lock.json" ]; then
+            PM="npm"
+            echo "Found package-lock.json, using npm"
+          else
+            PM="pnpm"
+            echo "No lockfile found, defaulting to pnpm"
+          fi
+          
+          # Install dependencies
+          case $PM in
+            "pnpm")
+              echo "Installing with pnpm..."
+              if [ -f "pnpm-lock.yaml" ]; then
+                pnpm install --frozen-lockfile || pnpm install
+              else
+                pnpm install
+              fi
+              ;;
+            "npm")
+              echo "Installing with npm..."
+              if [ -f "package-lock.json" ]; then
+                npm ci || npm install
+              else
+                npm install
+              fi
+              ;;
+            *)
+              echo "Unknown package manager: $PM, falling back to npm"
+              npm install
+              ;;
+          esac
+
+      - name: Lint code
+        shell: bash
+        run: |
+          PM=$([ -f ".package-manager" ] && cat .package-manager || echo "pnpm")
+          $PM lint
+
+      - name: Type check
+        shell: bash
+        run: |
+          PM=$([ -f ".package-manager" ] && cat .package-manager || echo "pnpm")
+          if [ "$PM" = "pnpm" ]; then
+            pnpm exec tsc --noEmit
+          else
+            npx tsc --noEmit
+          fi
+
+      - name: Build application
+        shell: bash
+        run: |
+          PM=$([ -f ".package-manager" ] && cat .package-manager || echo "pnpm")
+          $PM build
+        env:
+          VITE_CHAIN_ID: 43113
+          VITE_RPC_URL: https://api.avax-test.network/ext/bc/C/rpc
+
+  # Subgraph CI
+  subgraph-ci:
+    runs-on: ubuntu-latest
+    name: Subgraph CI
+    
+    defaults:
+      run:
+        working-directory: ./app-registerUI/pledg-r
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Graph CLI
+        run: npm install -g @graphprotocol/graph-cli
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate types
+        run: graph codegen
+
+      - name: Build subgraph
+        run: graph build
